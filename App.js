@@ -1,5 +1,27 @@
-import React, { useState, useEffect, useMemo } from "react";
+import React, { useState, useEffect, useMemo, useCallback } from "react";
 import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
+
+/* -------------------- Simple event logger (localStorage) -------------------- */
+function useEventLog() {
+  const log = useCallback((type, payload = {}) => {
+    const key = "streamlist.events";
+    let events = [];
+    try {
+      events = JSON.parse(localStorage.getItem(key)) || [];
+    } catch {
+      events = [];
+    }
+    const entry = {
+      id: crypto.randomUUID(),
+      ts: new Date().toISOString(),
+      type,
+      payload,
+    };
+    const next = [entry, ...events].slice(0, 1000); // keep it bounded
+    localStorage.setItem(key, JSON.stringify(next));
+  }, []);
+  return log;
+}
 
 /* -------------------- Layout -------------------- */
 function Layout({ children }) {
@@ -45,6 +67,8 @@ function NavItem({ to, label, icon, end }) {
 
 /* -------------------- Pages -------------------- */
 function HomeStreamList() {
+  const log = useEventLog();
+
   // Input text
   const [title, setTitle] = useState("");
 
@@ -68,6 +92,10 @@ function HomeStreamList() {
     localStorage.setItem("streamlist.items", JSON.stringify(items));
   }, [items]);
 
+  useEffect(() => {
+    log("page_view", { page: "home" });
+  }, [log]);
+
   // Add item & clear input
   function addItem(e) {
     e.preventDefault();
@@ -83,6 +111,7 @@ function HomeStreamList() {
     setItems((prev) => [newItem, ...prev]);
     setTitle("");
     console.log("StreamList item:", trimmed);
+    log("item_add", { title: trimmed });
   }
 
   // Toggle complete
@@ -92,6 +121,8 @@ function HomeStreamList() {
         it.id === id ? { ...it, completed: !it.completed } : it
       )
     );
+    const it = items.find((x) => x.id === id);
+    log("item_toggle", { id, title: it?.title, to: !it?.completed });
   }
 
   // Start edit
@@ -100,6 +131,7 @@ function HomeStreamList() {
     if (!it) return;
     setEditingId(id);
     setEditingText(it.title);
+    log("item_edit_start", { id, title: it.title });
   }
 
   // Save / cancel edit
@@ -109,22 +141,28 @@ function HomeStreamList() {
     setItems((prev) =>
       prev.map((it) => (it.id === editingId ? { ...it, title: trimmed } : it))
     );
+    log("item_edit_save", { id: editingId, newTitle: trimmed });
     setEditingId(null);
     setEditingText("");
   }
   function cancelEdit() {
+    log("item_edit_cancel", { id: editingId });
     setEditingId(null);
     setEditingText("");
   }
 
   // Delete single
   function removeItem(id) {
+    const it = items.find((x) => x.id === id);
     setItems((prev) => prev.filter((it) => it.id !== id));
+    log("item_delete", { id, title: it?.title });
   }
 
   // Bulk clear completed
   function clearCompleted() {
+    const removed = items.filter((i) => i.completed).map((r) => r.title);
     setItems((prev) => prev.filter((it) => !it.completed));
+    log("items_clear_completed", { removed });
   }
 
   // Derived data
@@ -139,6 +177,11 @@ function HomeStreamList() {
     const done = items.filter((i) => i.completed).length;
     return { total, done, left: total - done };
   }, [items]);
+
+  function setAndLogFilter(next) {
+    setFilter(next);
+    log("filter_change", { filter: next });
+  }
 
   return (
     <div className="stack">
@@ -164,18 +207,18 @@ function HomeStreamList() {
         {/* Toolbar */}
         <div className="toolbar">
           <div className="filters" role="tablist" aria-label="Filter items">
-            <FilterBtn active={filter === "all"} onClick={() => setFilter("all")}>
+            <FilterBtn active={filter === "all"} onClick={() => setAndLogFilter("all")}>
               All
             </FilterBtn>
             <FilterBtn
               active={filter === "active"}
-              onClick={() => setFilter("active")}
+              onClick={() => setAndLogFilter("active")}
             >
               Active
             </FilterBtn>
             <FilterBtn
               active={filter === "completed"}
-              onClick={() => setFilter("completed")}
+              onClick={() => setAndLogFilter("completed")}
             >
               Completed
             </FilterBtn>
@@ -287,10 +330,100 @@ function FilterBtn({ active, onClick, children }) {
   );
 }
 
-/* Placeholder pages */
+/* -------------------- TMDB Movies Page -------------------- */
 function Movies() {
-  return <EmptyPage title="Movies" />;
+  const log = useEventLog();
+  const [state, setState] = useState({ loading: true, error: null, data: [] });
+
+  const TMDB_KEY = process.env.REACT_APP_TMDB_API_KEY;
+  const CACHE_KEY = "streamlist.tmdb.popular.v1";
+
+  useEffect(() => {
+    log("page_view", { page: "movies" });
+
+    // Try cache first
+    try {
+      const cached = JSON.parse(localStorage.getItem(CACHE_KEY));
+      if (cached && Array.isArray(cached) && cached.length) {
+        setState({ loading: false, error: null, data: cached });
+      }
+    } catch {}
+
+    async function fetchPopular() {
+      if (!TMDB_KEY) {
+        setState({
+          loading: false,
+          error:
+            "TMDB API key missing. Add REACT_APP_TMDB_API_KEY to your .env and restart.",
+          data: [],
+        });
+        return;
+      }
+      setState((s) => ({ ...s, loading: true, error: null }));
+      try {
+        const res = await fetch(
+          `https://api.themoviedb.org/3/movie/popular?api_key=${TMDB_KEY}&language=en-US&page=1`
+        );
+        if (!res.ok) throw new Error(`TMDB error: ${res.status}`);
+        const json = await res.json();
+        const list = Array.isArray(json?.results) ? json.results : [];
+        setState({ loading: false, error: null, data: list });
+        localStorage.setItem(CACHE_KEY, JSON.stringify(list));
+        log("tmdb_fetch_success", { count: list.length });
+      } catch (err) {
+        setState({ loading: false, error: String(err.message || err), data: [] });
+        log("tmdb_fetch_error", { message: String(err.message || err) });
+      }
+    }
+    fetchPopular();
+  }, [TMDB_KEY, log]);
+
+  const imgBase = "https://image.tmdb.org/t/p/w342";
+
+  return (
+    <section className="stack">
+      <div className="card">
+        <h1>Popular Movies</h1>
+        <p className="muted">Fetched live from TMDB and cached locally.</p>
+        {state.loading && <p className="muted">Loading…</p>}
+        {state.error && <p className="muted" style={{ color: "#fecaca" }}>{state.error}</p>}
+
+        {!state.loading && !state.error && (
+          <div className="grid">
+            {state.data.map((m) => (
+              <button
+                key={m.id}
+                className="movie-card"
+                onClick={() => log("tmdb_click_movie", { id: m.id, title: m.title })}
+                title={m.title}
+              >
+                {m.poster_path ? (
+                  <img
+                    src={`${imgBase}${m.poster_path}`}
+                    alt={m.title}
+                    loading="lazy"
+                  />
+                ) : (
+                  <div className="no-poster">No Image</div>
+                )}
+                <div className="movie-meta">
+                  <div className="movie-title">{m.title}</div>
+                  <div className="movie-sub">
+                    <span className="material-symbols-outlined">star</span>
+                    <span>{m.vote_average?.toFixed?.(1) ?? m.vote_average}</span>
+                    <span className="dot">•</span>
+                    <span>{(m.release_date || "").slice(0, 4) || "—"}</span>
+                  </div>
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
+
 function Cart() {
   return <EmptyPage title="Cart" />;
 }
