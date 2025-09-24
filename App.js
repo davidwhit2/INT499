@@ -1,7 +1,60 @@
 import React, { useState, useEffect, useMemo, useCallback } from "react";
-import { BrowserRouter, Routes, Route, NavLink } from "react-router-dom";
+import { BrowserRouter as Router, Routes, Route, NavLink } from "react-router-dom";
 
-/* -------------------- Simple event logger (localStorage) -------------------- */
+/* ============================================================================
+   Utilities & Hooks
+============================================================================ */
+const uuid = () =>
+  (globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+/** Robust localStorage hook with JSON parsing, debounce, and cross-tab sync */
+function useLocalStorage(key, initialValue, { debounce = 0 } = {}) {
+  const [value, setValue] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw != null ? JSON.parse(raw) : initialValue;
+    } catch {
+      return initialValue;
+    }
+  });
+
+  useEffect(() => {
+    let t;
+    const write = () => {
+      try {
+        localStorage.setItem(key, JSON.stringify(value));
+      } catch {}
+    };
+    if (debounce > 0) {
+      t = setTimeout(write, debounce);
+    } else {
+      write();
+    }
+    return () => t && clearTimeout(t);
+  }, [key, value, debounce]);
+
+  // Cross-tab synchronization
+  useEffect(() => {
+    const onStorage = (e) => {
+      if (e.key === key && e.storageArea === localStorage) {
+        try {
+          const next = e.newValue != null ? JSON.parse(e.newValue) : initialValue;
+          setValue((curr) => {
+            // Avoid needless rerenders if value is the same
+            return JSON.stringify(curr) === JSON.stringify(next) ? curr : next;
+          });
+        } catch {}
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [key, initialValue]);
+
+  return [value, setValue];
+}
+
+/* Simple event logger -> localStorage (bounded) */
 function useEventLog() {
   const log = useCallback((type, payload = {}) => {
     const key = "streamlist.events";
@@ -11,19 +64,16 @@ function useEventLog() {
     } catch {
       events = [];
     }
-    const entry = {
-      id: crypto.randomUUID(),
-      ts: new Date().toISOString(),
-      type,
-      payload,
-    };
-    const next = [entry, ...events].slice(0, 1000); // keep it bounded
+    const entry = { id: uuid(), ts: new Date().toISOString(), type, payload };
+    const next = [entry, ...events].slice(0, 1000);
     localStorage.setItem(key, JSON.stringify(next));
   }, []);
   return log;
 }
 
-/* -------------------- Layout -------------------- */
+/* ============================================================================
+   Layout & Nav
+============================================================================ */
 function Layout({ children }) {
   return (
     <div>
@@ -54,43 +104,28 @@ function Layout({ children }) {
 
 function NavItem({ to, label, icon, end }) {
   return (
-    <NavLink
-      to={to}
-      end={end}
-      className={({ isActive }) => (isActive ? "active" : undefined)}
-    >
+    <NavLink to={to} end={end} className={({ isActive }) => (isActive ? "active" : undefined)}>
       {icon && <span className="material-symbols-outlined">{icon}</span>}
       <span>{label}</span>
     </NavLink>
   );
 }
 
-/* -------------------- Pages -------------------- */
+/* ============================================================================
+   Pages
+============================================================================ */
 function HomeStreamList() {
   const log = useEventLog();
 
-  // Input text
   const [title, setTitle] = useState("");
 
-  // Items with persistence
-  const [items, setItems] = useState(() => {
-    try {
-      const saved = localStorage.getItem("streamlist.items");
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  // Items persisted with debounce and cross-tab sync
+  const [items, setItems] = useLocalStorage("streamlist.items", [], { debounce: 200 });
 
-  // UI state for filtering and editing
-  const [filter, setFilter] = useState("all"); // "all" | "active" | "completed"
+  // Persisted filter so the UI reopens how the user left it
+  const [filter, setFilter] = useLocalStorage("streamlist.filter", "all");
   const [editingId, setEditingId] = useState(null);
   const [editingText, setEditingText] = useState("");
-
-  // Persist items to localStorage
-  useEffect(() => {
-    localStorage.setItem("streamlist.items", JSON.stringify(items));
-  }, [items]);
 
   useEffect(() => {
     log("page_view", { page: "home" });
@@ -99,15 +134,9 @@ function HomeStreamList() {
   // Add item & clear input
   function addItem(e) {
     e.preventDefault();
-    const trimmed = title.trim();
+    const trimmed = title.replace(/\s+/g, " ").trim();
     if (!trimmed) return;
-
-    const newItem = {
-      id: crypto.randomUUID(),
-      title: trimmed,
-      completed: false,
-      createdAt: Date.now(),
-    };
+    const newItem = { id: uuid(), title: trimmed, completed: false, createdAt: Date.now() };
     setItems((prev) => [newItem, ...prev]);
     setTitle("");
     console.log("StreamList item:", trimmed);
@@ -116,13 +145,11 @@ function HomeStreamList() {
 
   // Toggle complete
   function toggleComplete(id) {
+    const current = items.find((x) => x.id === id);
     setItems((prev) =>
-      prev.map((it) =>
-        it.id === id ? { ...it, completed: !it.completed } : it
-      )
+      prev.map((it) => (it.id === id ? { ...it, completed: !it.completed } : it))
     );
-    const it = items.find((x) => x.id === id);
-    log("item_toggle", { id, title: it?.title, to: !it?.completed });
+    log("item_toggle", { id, title: current?.title, to: !current?.completed });
   }
 
   // Start edit
@@ -136,11 +163,9 @@ function HomeStreamList() {
 
   // Save / cancel edit
   function saveEdit() {
-    const trimmed = editingText.trim();
+    const trimmed = editingText.replace(/\s+/g, " ").trim();
     if (!trimmed) return cancelEdit();
-    setItems((prev) =>
-      prev.map((it) => (it.id === editingId ? { ...it, title: trimmed } : it))
-    );
+    setItems((prev) => prev.map((it) => (it.id === editingId ? { ...it, title: trimmed } : it)));
     log("item_edit_save", { id: editingId, newTitle: trimmed });
     setEditingId(null);
     setEditingText("");
@@ -154,7 +179,7 @@ function HomeStreamList() {
   // Delete single
   function removeItem(id) {
     const it = items.find((x) => x.id === id);
-    setItems((prev) => prev.filter((it) => it.id !== id));
+    setItems((prev) => prev.filter((x) => x.id !== id));
     log("item_delete", { id, title: it?.title });
   }
 
@@ -210,10 +235,7 @@ function HomeStreamList() {
             <FilterBtn active={filter === "all"} onClick={() => setAndLogFilter("all")}>
               All
             </FilterBtn>
-            <FilterBtn
-              active={filter === "active"}
-              onClick={() => setAndLogFilter("active")}
-            >
+            <FilterBtn active={filter === "active"} onClick={() => setAndLogFilter("active")}>
               Active
             </FilterBtn>
             <FilterBtn
@@ -291,18 +313,10 @@ function HomeStreamList() {
                 {/* Row actions */}
                 {editingId !== it.id && (
                   <div className="actions">
-                    <button
-                      className="icon-btn"
-                      title="Edit"
-                      onClick={() => startEdit(it.id)}
-                    >
+                    <button className="icon-btn" title="Edit" onClick={() => startEdit(it.id)}>
                       <span className="material-symbols-outlined">edit</span>
                     </button>
-                    <button
-                      className="icon-btn danger"
-                      title="Delete"
-                      onClick={() => removeItem(it.id)}
-                    >
+                    <button className="icon-btn danger" title="Delete" onClick={() => removeItem(it.id)}>
                       <span className="material-symbols-outlined">delete</span>
                     </button>
                   </div>
@@ -316,15 +330,9 @@ function HomeStreamList() {
   );
 }
 
-/* Small component for filter chips */
 function FilterBtn({ active, onClick, children }) {
   return (
-    <button
-      className={`chip ${active ? "chip-active" : ""}`}
-      onClick={onClick}
-      role="tab"
-      aria-selected={active}
-    >
+    <button className={`chip ${active ? "chip-active" : ""}`} onClick={onClick} role="tab" aria-selected={active}>
       {children}
     </button>
   );
@@ -336,49 +344,54 @@ function Movies() {
   const [state, setState] = useState({ loading: true, error: null, data: [] });
 
   const TMDB_KEY = process.env.REACT_APP_TMDB_API_KEY;
-  const CACHE_KEY = "streamlist.tmdb.popular.v1";
+  const CACHE_KEY = "streamlist.tmdb.popular.v2"; // bump key on structure change
+  const CACHE_TTL_MS = 1000 * 60 * 60; // 1 hour
+  const imgBase = "https://image.tmdb.org/t/p/w342";
 
   useEffect(() => {
     log("page_view", { page: "movies" });
 
-    // Try cache first
+    // Try fresh-enough cache
     try {
       const cached = JSON.parse(localStorage.getItem(CACHE_KEY));
-      if (cached && Array.isArray(cached) && cached.length) {
-        setState({ loading: false, error: null, data: cached });
+      if (cached && cached.ts && cached.data && Date.now() - cached.ts < CACHE_TTL_MS) {
+        setState({ loading: false, error: null, data: cached.data });
       }
     } catch {}
 
-    async function fetchPopular() {
-      if (!TMDB_KEY) {
-        setState({
-          loading: false,
-          error:
-            "TMDB API key missing. Add REACT_APP_TMDB_API_KEY to your .env and restart.",
-          data: [],
-        });
-        return;
-      }
-      setState((s) => ({ ...s, loading: true, error: null }));
+    if (!TMDB_KEY) {
+      setState({
+        loading: false,
+        error: "TMDB API key missing. Add REACT_APP_TMDB_API_KEY to your .env and restart.",
+        data: [],
+      });
+      return;
+    }
+
+    const ac = new AbortController();
+
+    (async () => {
       try {
+        setState((s) => ({ ...s, loading: true, error: null }));
         const res = await fetch(
-          `https://api.themoviedb.org/3/movie/popular?api_key=${TMDB_KEY}&language=en-US&page=1`
+          `https://api.themoviedb.org/3/movie/popular?api_key=${TMDB_KEY}&language=en-US&page=1`,
+          { signal: ac.signal }
         );
         if (!res.ok) throw new Error(`TMDB error: ${res.status}`);
         const json = await res.json();
         const list = Array.isArray(json?.results) ? json.results : [];
         setState({ loading: false, error: null, data: list });
-        localStorage.setItem(CACHE_KEY, JSON.stringify(list));
+        localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: Date.now(), data: list }));
         log("tmdb_fetch_success", { count: list.length });
       } catch (err) {
+        if (ac.signal.aborted) return;
         setState({ loading: false, error: String(err.message || err), data: [] });
         log("tmdb_fetch_error", { message: String(err.message || err) });
       }
-    }
-    fetchPopular();
-  }, [TMDB_KEY, log]);
+    })();
 
-  const imgBase = "https://image.tmdb.org/t/p/w342";
+    return () => ac.abort();
+  }, [TMDB_KEY, log]);
 
   return (
     <section className="stack">
@@ -401,7 +414,9 @@ function Movies() {
                   <img
                     src={`${imgBase}${m.poster_path}`}
                     alt={m.title}
+                    width={228} height={342} // prevent layout shift for w342 posters
                     loading="lazy"
+                    onError={(e) => (e.currentTarget.src = "/images/fallback-poster.png")}
                   />
                 ) : (
                   <div className="no-poster">No Image</div>
@@ -424,12 +439,8 @@ function Movies() {
   );
 }
 
-function Cart() {
-  return <EmptyPage title="Cart" />;
-}
-function About() {
-  return <EmptyPage title="About" />;
-}
+function Cart() { return <EmptyPage title="Cart" />; }
+function About() { return <EmptyPage title="About" />; }
 function EmptyPage({ title }) {
   return (
     <section className="card" style={{ textAlign: "center", padding: 40 }}>
@@ -439,10 +450,14 @@ function EmptyPage({ title }) {
   );
 }
 
-/* -------------------- App Root -------------------- */
+/* ============================================================================
+   App Root
+   NOTE: If you deploy to GitHub Pages, switching to HashRouter avoids refresh 404s:
+   import { HashRouter as Router } from "react-router-dom";
+============================================================================ */
 export default function App() {
   return (
-    <BrowserRouter>
+    <Router>
       <Layout>
         <Routes>
           <Route path="/" element={<HomeStreamList />} />
@@ -451,6 +466,6 @@ export default function App() {
           <Route path="/about" element={<About />} />
         </Routes>
       </Layout>
-    </BrowserRouter>
+    </Router>
   );
 }
